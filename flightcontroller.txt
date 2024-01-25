@@ -1,0 +1,329 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <PulsePosition.h>
+
+
+void readBatteryVoltage();                           // Function to read the battery voltage
+void readIMU();                                      // Function to read the Gyro data
+void readReceiver();                                 // Function to read the receiver data
+void pidControl(float error, float P, float I, float D, float prevError, float prevIterm); // Function to calculate the PID output
+void resetPid();                                     // Function to reset the PID memory
+void kalman1D(float kalmanState, float kalmanUncertainty, float kalmanInput, float kalmanMeasurement); // Function to calculate the kalman filter output
+
+
+float batteryVoltage, batteryCurrent, batteryRemaining, batteryAtStart, currentConsumed = 0, batteryCapacity = 2200;
+
+float yawRate, pitchRate, rollRate;
+int calibNum;
+float yawRateOffset, pitchRateOffset, rollRateOffset;
+
+float accX, accY, accZ;
+float rollAngle, pitchAngle;
+
+PulsePositionInput ppmInput(RISING);                      
+int chnlNum = 0; 
+float receiverValues[] = {0, 0, 0, 0, 0, 0, 0, 0}; 
+
+uint32_t loopTimer;                                  // Variable to store the loop time
+float desiredYawRate, desiredPitchRate, desiredRollRate;
+float errorYawRate, errorPitchRate, errorRollRate;                                 
+float prevErrorYawRate, prevErrorPitchRate, prevErrorRollRate;
+float prevItermYawRate, prevItermPitchRate, prevItermRollRate;
+float throttleInput, yawInput, pitchInput, rollInput;
+float pidOutput[] = {0, 0, 0};
+float P_yawRate = 2, I_yawRate = 12, D_yawRate = 0;
+float P_pitchRate = 0.6, I_pitchRate = 3.5, D_pitchRate = 0.03;
+float P_rollRate = P_pitchRate, I_rollRate = I_pitchRate, D_rollRate = D_pitchRate;
+float motorInput1, motorInput2, motorInput3, motorInput4;
+
+float kalmanRollAngle = 0, kalmanUncertaintyRollAngle = 2*2;
+float kalmanPitchAngle = 0, kalmanUncertaintyPitchAngle = 2*2;
+float kalman1DOutput[] = {0, 0};                     // {kalmanAngle prediction, Uncertainty of kalmanAngle prediction}
+
+float desiredRollAngle, desiredPitchAngle;
+float errorRollAngle, errorPitchAngle;
+float prevErrorRollAngle, prevErrorPitchAngle;
+float prevItermRollAngle, prevItermPitchAngle;
+float P_rollAngle = 2, I_rollAngle = 0, D_rollAngle = 0;
+float P_pitchAngle = P_rollAngle, I_pitchAngle = I_rollAngle, D_pitchAngle = D_rollAngle;
+
+
+void setup()
+{
+  Serial.begin(115200);                              // Initialize serial communication at 115200 baud rate
+  pinMode(13, OUTPUT);                               // Set pin 13 as OUTPUT to control the LED
+  digitalWrite(13, HIGH);                            // Turn on the LED
+  pinMode(6, OUTPUT);                                // Set pin 6 as OUTPUT to control setup mode LED
+  digitalWrite(6, LOW);                              // Turn off control setup LED
+  pinMode(5, OUTPUT);                                // Set pin 5 as OUTPUT to control the low battery indicator LED
+  digitalWrite(5, HIGH);                             // Turn on low battery indicator LED
+  
+  Wire.setClock(400000);                             // Set I2C frequency to 400kHz
+  Wire.begin();                                      // Initialize I2C communication as Master
+  delay(500);                                        // Wait for the IMU to power up
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68)
+  Wire.write(0x6B);                                  // Request access to MPU6050_PWR_MGMT_1 register(0x6B)
+  Wire.write(0x00);                                  // Set the register bits as 00000000 to reset the IMU
+  Wire.endTransmission();                            // End the transmission
+
+  for (calibNum = 0; calibNum < 2000; calibNum++)    // Calibrate the IMU by reading the gyro data 2000 times
+  {
+    readIMU();                                       // Read the gyro data
+    yawRateOffset += yawRate;                        // Add the yaw rate to yawRateOffset
+    pitchRateOffset += pitchRate;                    // Add the pitch rate to pitchRateOffset
+    rollRateOffset += rollRate;                      // Add the roll rate to rollRateOffset
+    delay(1);                                        // Add a 1ms delay to avoid overloading the IMU
+  }
+  yawRateOffset /= 2000;                             // Divide the yawRateOffset by 2000 to get the average of yawRateOffset
+  pitchRateOffset /= 2000;                           // Divide the pitchRateOffset by 2000 to get the average of pitchRateOffset
+  rollRateOffset /= 2000;                            // Divide the rollRateOffset by 2000 to get the average of rollRateOffset
+
+  ppmInput.begin(14);                                 // Initialize the PPM input on pin 14
+
+  analogWriteFrequency(1, 250);                       // Set the PWM frequency to 250Hz* (ESC Specification), (pin 1 -> motor 1)
+  analogWriteFrequency(2, 250);                       // Set the PWM frequency to 250Hz* (ESC Specification), (pin 2 -> motor 2)
+  analogWriteFrequency(3, 250);                       // Set the PWM frequency to 250Hz* (ESC Specification), (pin 3 -> motor 3)
+  analogWriteFrequency(4, 250);                       // Set the PWM frequency to 250Hz* (ESC Specification), (pin 4 -> motor 4)
+  analogWriteResolution(12);                          // Set the PWM resolution to 12 bits (4096 levels)
+
+  digitalWrite(6, HIGH);                              // Turn on setup mode LED
+
+  readBatteryVoltage();                              // Read the battery voltage & current
+  if (batteryVoltage > 12.45)
+  {
+    digitalWrite(5, LOW);                            // Turn off low battery indicator LED
+    batteryAtStart = batteryCapacity;                // Set the batteryAtStart to batteryCapacity
+  }
+  else if (batteryVoltage < 11.25)
+  {
+    batteryAtStart = 0.3*batteryCapacity;            // Set the batteryAtStart to 30% of batteryCapacity
+  }
+  else
+  {
+    digitalWrite(5, LOW);                            // Turn off low battery indicator LED
+    batteryAtStart = (0.6087*batteryVoltage-6.5783)*batteryCapacity;   // Set the batteryAtStart to 30% of batteryCapacity
+  }
+
+  while (receiverValues[2] < 1020 || receiverValues[2] > 1050)         // To avoid accidental motor start        
+  {
+    readReceiver();                                   // Read the receiver data
+    delay(4);                                         // Add a 4ms delay to avoid overloading the receiver
+  }
+  
+  loopTimer = micros();                               // Set the loopTimer to current time in μs
+}
+
+
+void loop()
+{
+  readIMU();                                         // Read the IMU Accel & Gyro data and update Angles & Rotation rates
+  yawRate -= yawRateOffset;                          // Subtract the yawRateOffset from yawRate
+  pitchRate -= pitchRateOffset;                      // Subtract the pitchRateOffset from pitchRate
+  rollRate -= rollRateOffset;                        // Subtract the rollRateOffset from rollRate
+
+  kalman1D(kalmanRollAngle, kalmanUncertaintyRollAngle, rollRate, rollAngle);      // Calculate the roll angle using kalman filter
+  kalmanRollAngle = kalman1DOutput[0];                                             // Set the kalmanRollAngle to kalman1DOutput[0]
+  kalmanUncertaintyRollAngle = kalman1DOutput[1];                                  // Set the uncertainty of kalmanRollAngle to kalman1DOutput[1]
+  kalman1D(kalmanPitchAngle, kalmanUncertaintyPitchAngle, pitchRate, pitchAngle);  // Calculate the pitch angle using kalman filter
+  kalmanPitchAngle = kalman1DOutput[0];                                            // Set the kalmanPitchAngle to kalman1DOutput[0]
+  kalmanUncertaintyPitchAngle = kalman1DOutput[1];                                 // Set the uncertainty of kalmanPitchAngle to kalman1DOutput[1]
+
+  readReceiver();                                    // Read the receiver data
+  desiredRollAngle = 0.1*(receiverValues[0]-1500);   // Set the desired roll angle [(1000 to 2000 μs) --> (-50 to 50 deg)]
+  desiredPitchAngle = 0.1*(receiverValues[1]-1500);  // Set the desired pitch angle [(1000 to 2000 μs) --> (-50 to 50 deg)]
+  throttleInput = receiverValues[2];                 // Set the throttle input to receiverValues[2] (1000-2000μs)
+  desiredYawRate = 0.15*(receiverValues[3]-1500);    // Set the desired yaw rate [(1000 to 2000 μs) --> (-75 to 75 deg/s)]
+
+  errorRollAngle = desiredRollAngle - kalmanRollAngle;     // Calculate the error in roll angle
+  errorPitchAngle = desiredPitchAngle - kalmanPitchAngle;  // Calculate the error in pitch angle
+
+  pidControl(errorRollAngle, P_rollAngle, I_rollAngle, D_rollAngle, prevErrorRollAngle, prevItermRollAngle);       // Calculate the PID output for roll angle
+  desiredRollRate = pidOutput[0];                    // Set the desired roll rate to pidOutput[0]
+  prevErrorRollAngle = pidOutput[1];                 // Set the previous error to pidOutput[1]
+  prevItermRollAngle = pidOutput[2];                 // Set the previous integral term to pidOutput[2]
+  pidControl(errorPitchAngle, P_pitchAngle, I_pitchAngle, D_pitchAngle, prevErrorPitchAngle, prevItermPitchAngle); // Calculate the PID output for pitch angle
+  desiredPitchRate = pidOutput[0];                   // Set the desired pitch rate to pidOutput[0]
+  prevErrorPitchAngle = pidOutput[1];                // Set the previous error to pidOutput[1]
+  prevItermPitchAngle = pidOutput[2];                // Set the previous integral term to pidOutput[2]
+
+  errorRollRate = desiredRollRate - rollRate;        // Calculate the error in roll rate
+  errorPitchRate = desiredPitchRate - pitchRate;     // Calculate the error in pitch rate
+  errorYawRate = desiredYawRate - yawRate;           // Calculate the error in yaw rate
+
+  pidControl(errorRollRate, P_rollRate, I_rollRate, D_rollRate, prevErrorRollRate, prevItermRollRate);       // Calculate the PID output for roll rate
+  rollInput = pidOutput[0];                          // Set the roll input to pidOutput[0]
+  prevErrorRollRate = pidOutput[1];                  // Set the previous error to pidOutput[1]
+  prevItermRollRate = pidOutput[2];                  // Set the previous integral term to pidOutput[2]
+  pidControl(errorPitchRate, P_pitchRate, I_pitchRate, D_pitchRate, prevErrorPitchRate, prevItermPitchRate); // Calculate the PID output for pitch rate
+  pitchInput = pidOutput[0];                         // Set the pitch input to pidOutput[0]
+  prevErrorPitchRate = pidOutput[1];                 // Set the previous error to pidOutput[1]
+  prevItermPitchRate = pidOutput[2];                 // Set the previous integral term to pidOutput[2]
+  pidControl(errorYawRate, P_yawRate, I_yawRate, D_yawRate, prevErrorYawRate, prevItermYawRate);             // Calculate the PID output for yaw rate
+  yawInput = pidOutput[0];                           // Set the yaw input to pidOutput[0]
+  prevErrorYawRate = pidOutput[1];                   // Set the previous error to pidOutput[1]
+  prevItermYawRate = pidOutput[2];                   // Set the previous integral term to pidOutput[2]
+
+  if (throttleInput > 1800) throttleInput = 1800;     // Limit the throttle input to 1800μs
+   
+  motorInput1 = 1.024*(throttleInput - rollInput - pitchInput - yawInput);   // Calculate the motor input for motor 1 (0-4000 μs --> 0-4096 bits)
+  motorInput2 = 1.024*(throttleInput + rollInput - pitchInput + yawInput);   // Calculate the motor input for motor 2 (0-4000 μs --> 0-4096 bits)
+  motorInput3 = 1.024*(throttleInput + rollInput + pitchInput - yawInput);   // Calculate the motor input for motor 3 (0-4000 μs --> 0-4096 bits)
+  motorInput4 = 1.024*(throttleInput - rollInput + pitchInput + yawInput);   // Calculate the motor input for motor 4 (0-4000 μs --> 0-4096 bits) 
+  if (motorInput1 > 2030) motorInput1 = 2030;                                // Limit the motor input to 2000μs (2048 bits)
+  if (motorInput2 > 2030) motorInput2 = 2030;                                // Limit the motor input to 2000μs (2048 bits)
+  if (motorInput3 > 2030) motorInput3 = 2030;                                // Limit the motor input to 2000μs (2048 bits)
+  if (motorInput4 > 2030) motorInput4 = 2030;                                // Limit the motor input to 2000μs (2048 bits)
+
+  int throttleIdeal = 1210;                                                  // Set the ideal throttle value (1180μs --> 1208.32 bits), Keep motors running at 18% power during flight
+  if (motorInput1 < throttleIdeal) motorInput1 = throttleIdeal;              // Set the motor input to throttleIdeal if motorInput1 < throttleIdeal
+  if (motorInput2 < throttleIdeal) motorInput2 = throttleIdeal;              // Set the motor input to throttleIdeal if motorInput2 < throttleIdeal
+  if (motorInput3 < throttleIdeal) motorInput3 = throttleIdeal;              // Set the motor input to throttleIdeal if motorInput3 < throttleIdeal
+  if (motorInput4 < throttleIdeal) motorInput4 = throttleIdeal;              // Set the motor input to throttleIdeal if motorInput4 < throttleIdeal
+
+  int throttleCutoff = 1024;                                                // Set the throttle cutoff value (1000μs --> 1024 bits), Turn off motors completely at throttle below 5%
+  if (receiverValues[2] < 1050)                                             // Check if receiverValues[2] < 1050μs
+  {
+    motorInput1 = throttleCutoff;                                           // Set the motor input to throttleCutoff if receiverValues[2] < 1050μs
+    motorInput2 = throttleCutoff;                                           // Set the motor input to throttleCutoff if receiverValues[2] < 1050μs
+    motorInput3 = throttleCutoff;                                           // Set the motor input to throttleCutoff if receiverValues[2] < 1050μs
+    motorInput4 = throttleCutoff;                                           // Set the motor input to throttleCutoff if receiverValues[2] < 1050μs
+    resetPid();                                                             // Reset the PID
+  }
+
+  analogWrite(1, motorInput1);                                               // Set the motor speed to motorInput1
+  analogWrite(2, motorInput2);                                               // Set the motor speed to motorInput2
+  analogWrite(3, motorInput3);                                               // Set the motor speed to motorInput3
+  analogWrite(4, motorInput4);                                               // Set the motor speed to motorInput4
+  
+  readBatteryVoltage();                              // Read the battery voltage
+  currentConsumed += batteryCurrent*1000*0.004/3600; // Update current consumed (mAh) assuming 4ms* loop time
+  batteryRemaining = (batteryAtStart-currentConsumed)/batteryCapacity*100; // Calculate the battery remaining (mAh)
+  if (batteryRemaining <= 30)                         // Check if battery remaining is less than 30%
+  {
+    digitalWrite(5, HIGH);                           // Turn on low battery indicator LED
+  }
+  else
+  {
+    digitalWrite(5, LOW);                            // Turn off low battery indicator LED
+  }
+
+  while (micros() - loopTimer < 4000);               // Wait for 4ms* loop time
+  loopTimer = micros();                              // Set the loopTimer to current time in μs
+  
+  
+  // Serial.println("Battery Voltage: " + String(batteryVoltage) + "V");  // Print the battery voltage on the serial monitor
+  // Serial.print("Yaw Rate: " + String(yawRate) + "deg/s\t");            // Print the yaw rate on the serial monitor
+  // Serial.print("Pitch Rate: " + String(pitchRate) + "deg/s\t");        // Print the pitch rate on the serial monitor
+  // Serial.println("Roll Rate: " + String(rollRate) + "deg/s");          // Print the roll rate on the serial monitor
+  // Serial.println("Accel X[g]: " + String(accX) + "\t Accel Y[g]: " + String(accY) + "\t Accel Z[g]: " + String(accZ)); // Print the acceleration on the serial monitor
+  // Serial.println("Roll Angle [deg]: " + String(rollAngle) + "\t Pitch Angle [deg]: " + String(pitchAngle));            // Print the roll & pitch angle on the serial monitor
+  // Serial.println("Kalman Roll Angle [deg]: " + String(kalmanRollAngle) + "\t Kalman Pitch Angle [deg]: " + String(kalmanPitchAngle));  // Print the kalman roll & kalman pitch angle on the serial monitor
+  // Serial.print("No. of channels: " + String(chnlNum) + "\t");        // Print the receiver values on the serial monitor
+  // Serial.print("Roll [μs]: " + String(receiverValues[0]) + "\t");      
+  // Serial.print("Pitch [μs]: " + String(receiverValues[1]) + "\t");
+  // Serial.print("Throttle [μs]: " + String(receiverValues[2]) + "\t");
+  // Serial.println("Yaw [μs]: " + String(receiverValues[3]) + "\t");
+  // delay(50);                                         // Add a 50ms delay to avoid overloading the serial monitor
+}
+
+
+void readBatteryVoltage()
+{
+  batteryVoltage = analogRead(15) / 63;              // Read the battery voltage(V) from A1 pin 
+  batteryCurrent = analogRead(21) * 0.0896;          // Read the battery current(A) from A7 pin 
+}
+
+
+void readIMU()
+{
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68) 
+  Wire.write(0x1A);                                  // Request access to Gyro configuration register(0x1A) 
+  Wire.write(0x05);                                  // Set LPF with 10Hz bandwidth & 1KHz sample rate for Gyro & Accel
+  Wire.endTransmission();                            // End the transmission
+
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68)
+  Wire.write(0x1C);                                  // Request access to Accel configuration register(0x1C)
+  Wire.write(0x10);                                  // Set sensitivity 4096LSB/g & full scale range +-8g
+  Wire.endTransmission();                            // End the transmission
+
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68)
+  Wire.write(0x3B);                                  // Request access to ACCEL_XOUT data register(0x3B)
+  Wire.endTransmission();                            // End the transmission
+  Wire.requestFrom(0x68, 6);                         // Request 6 bytes of data from MPU6050
+  int16_t accXLSB = Wire.read() << 8 | Wire.read();  // Read first 2 bytes of data (ACCEL_XOUT[15:8] & ACCEL_XOUT[7:0])
+  int16_t accYLSB = Wire.read() << 8 | Wire.read();  // Read next 2 bytes of data (ACCEL_YOUT[15:8] & ACCEL_YOUT[7:0])
+  int16_t accZLSB = Wire.read() << 8 | Wire.read();  // Read next 2 bytes of data (ACCEL_ZOUT[15:8] & ACCEL_ZOUT[7:0])
+
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68)
+  Wire.write(0x1B);                                  // Request access to Gyro configuration register(0x1B)
+  Wire.write(0x08);                                  // Set sensitivity 65.5LSB/(deg/s) & full scale range +-500deg/s 
+  Wire.endTransmission();                            // End the transmission
+
+  Wire.beginTransmission(0x68);                      // Start communication with MPU6050(I2C address 0x68)
+  Wire.write(0x43);                                  // Request access to GYRO_XOUT data register(0x43)
+  Wire.endTransmission();                            // End the transmission
+  Wire.requestFrom(0x68, 6);                         // Request 6 bytes of data from MPU6050
+  int16_t gyroX = Wire.read() << 8 | Wire.read();    // Read first 2 bytes of data (GYRO_XOUT[15:8] & GYRO_XOUT[7:0])
+  int16_t gyroY = Wire.read() << 8 | Wire.read();    // Read next 2 bytes of data (GYRO_YOUT[15:8] & GYRO_YOUT[7:0])
+  int16_t gyroZ = Wire.read() << 8 | Wire.read();    // Read next 2 bytes of data (GYRO_ZOUT[15:8] & GYRO_ZOUT[7:0])
+
+  yawRate = (float)gyroX / 65.5;                     // Convert the gyro raw data into deg/s
+  pitchRate = (float)gyroY / 65.5;                   // Convert the gyro raw data into deg/s
+  rollRate = (float)gyroZ / 65.5;                    // Convert the gyro raw data into deg/s
+
+  accX = (float)accXLSB / 4096;      // *(float)accXLSB / 4096 + biasX;                      // Convert the accel raw data into g
+  accY = (float)accYLSB / 4096;      // *(float)accYLSB / 4096 + biasY;                      // Convert the accel raw data into g
+  accZ = (float)accZLSB / 4096;      // *(float)accZLSB / 4096 + biasZ;                      // Convert the accel raw data into g
+  rollAngle = atan(accY/sqrt(accX*accX+accZ*accZ)) * (180/3.142);   // Calculate the roll angle
+  pitchAngle = -atan(accX/sqrt(accY*accY+accZ*accZ)) * (180/3.142); // Calculate the pitch angle
+}
+
+
+void readReceiver()
+{
+  chnlNum = ppmInput.available();                    // Read the number of channels available
+  if (chnlNum > 0)                                   // Check if at least 1 channel is available
+  {
+    for (int i = 0; i < chnlNum; i++)
+    {
+      receiverValues[i] = ppmInput.read(i);          // Read the available channels(μs) into receiverValues array
+    }
+  }
+}
+
+
+void pidControl(float error, float P, float I, float D, float prevError, float prevIterm)
+{
+  float Pterm = P*error;                                 // Calculate the proportional term
+  float Iterm = prevIterm + I*(error+prevError)*0.004/2; // Calculate the integral term assuming 4ms* loop time
+  Iterm = constrain(Iterm, -400, 400);                   // Limit the integral term to +-400
+  float Dterm = D*(error-prevError)/0.004;               // Calculate the derivative term assuming 4ms* loop time
+  float pidResult = Pterm + Iterm + Dterm;               // Calculate the PID output
+  pidResult = constrain(pidResult, -400, 400);           // Limit the PID output to +-400
+  pidOutput[0] = pidResult;                              // Set the PID output to pidOutput[0]
+  pidOutput[1] = error;                                  // Set the error to pidOutput[1]
+  pidOutput[2] = Iterm;                                  // Set the integral term to pidOutput[2]
+}
+
+
+void resetPid()
+{
+  prevErrorYawRate = 0, prevErrorPitchRate = 0, prevErrorRollRate = 0;         // Reset the previous error
+  prevItermYawRate = 0, prevItermPitchRate = 0, prevItermRollRate = 0;         // Reset the previous integral term
+
+  prevErrorRollAngle = 0, prevErrorPitchAngle = 0;                             // Reset the previous error
+  prevItermRollAngle = 0, prevItermPitchAngle = 0;                             // Reset the previous integral term
+}
+
+
+void kalman1D(float kalmanState, float kalmanUncertainty, float kalmanInput, float kalmanMeasurement)
+{
+  // kalmanInput = rotation rate, kalmanMeasurement = accelerometer angle, kalmanState = angle calculated with the kalman filter
+  kalmanState = kalmanState + 0.004*kalmanInput;                             // Predict the current state of the system
+  kalmanUncertainty = kalmanUncertainty + 0.004*0.004*4*4;                   // Calculate the uncertainty of the predicted state
+  float kalmanGain = kalmanUncertainty*1 / (1*kalmanUncertainty + 3*3);      // Calculate the kalmanGain from the uncertainties on the predictions and measurements
+  kalmanState = kalmanState + kalmanGain*(kalmanMeasurement-kalmanState);    // Update the predicted state of the system with the measurement of the state through the kalman gain
+  kalmanUncertainty = (1-kalmanGain)*kalmanUncertainty;                      // Update the uncertainty of the predicted state
+  kalman1DOutput[0] = kalmanState;                                           // Set the kalmanAngle prediction to kalman1DOutput[0]
+  kalman1DOutput[1] = kalmanUncertainty;                                     // Set the uncertainty of kalmanAngle prediction to kalman1DOutput[1]
+}
